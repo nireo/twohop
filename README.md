@@ -1,4 +1,4 @@
-# Twohop
+# twohop
 
 A Rust proof of concept for carrying WireGuard traffic through a QUIC entry
 relay to an independently operated VPN exit, inspired by Obscura's two-party
