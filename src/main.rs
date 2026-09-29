@@ -2,6 +2,8 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 
+pub mod config;
+
 #[derive(Parser)]
 #[command(about = "Forward WireGuard packets through a QUIC entry relay")]
 struct Cli {
@@ -29,12 +31,23 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Client { config } => run_placeholder("client", config),
-        Command::Relay { config } => run_placeholder("relay", config),
+        Command::Client { config } => match config::load_client(&config) {
+            Ok(_config) => transport_not_implemented("client"),
+            Err(error) => config_error(error),
+        },
+        Command::Relay { config } => match config::load_relay(&config) {
+            Ok(_config) => transport_not_implemented("relay"),
+            Err(error) => config_error(error),
+        },
     }
 }
 
-fn run_placeholder(command: &str, _config: PathBuf) -> ExitCode {
-    eprintln!("{command} configuration loading is not implemented yet (M1 step 2)");
+fn config_error(error: String) -> ExitCode {
+    eprintln!("{error}");
+    ExitCode::FAILURE
+}
+
+fn transport_not_implemented(command: &str) -> ExitCode {
+    eprintln!("{command} configuration loaded; transport is not implemented yet (M2)");
     ExitCode::FAILURE
 }

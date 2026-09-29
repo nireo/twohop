@@ -1,0 +1,7 @@
+# Relative file paths are resolved from the current working directory.
+local_bind = "127.0.0.1:51821"
+wireguard_port = 51820
+relay_addr = "127.0.0.1:4433"
+server_name = "relay.twohop.test"
+ca_cert_file = "local/ca.pem"
+token_file = "local/token"

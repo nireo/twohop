@@ -1,0 +1,12 @@
+# Relative file paths are resolved from the current working directory.
+listen = "0.0.0.0:4433"
+exit_addr = "127.0.0.1:51820"
+cert_file = "local/relay.pem"
+key_file = "local/relay-key.pem"
+token_file = "local/token"
+
+[limits]
+max_active_sessions = 32
+max_pending_handshakes = 32
+setup_timeout_secs = 10
+idle_timeout_secs = 60
