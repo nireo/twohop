@@ -1,0 +1,14 @@
+[req]
+prompt = no
+distinguished_name = dn
+
+[dn]
+CN = relay.twohop.test
+
+[v3_server]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:relay.twohop.test
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
