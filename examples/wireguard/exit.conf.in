@@ -1,0 +1,8 @@
+# wg setconf format; linux.sh installs the address and MTU in the exit namespace.
+[Interface]
+PrivateKey = @EXIT_PRIVATE_KEY@
+ListenPort = 51820
+
+[Peer]
+PublicKey = @CLIENT_PUBLIC_KEY@
+AllowedIPs = 10.203.2.2/32

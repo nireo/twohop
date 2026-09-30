@@ -1,0 +1,7 @@
+# Run from the repository root.
+local_bind = "127.0.0.1:51821"
+wireguard_port = 51820
+relay_addr = "@RELAY_IP@:4433"
+server_name = "relay.twohop.test"
+ca_cert_file = "local/demo/tls/ca.pem"
+token_file = "local/demo/tls/token"

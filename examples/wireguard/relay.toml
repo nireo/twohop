@@ -1,0 +1,12 @@
+# Run from the guest's twohop-demo directory. This directory has no WG keys.
+listen = "0.0.0.0:4433"
+exit_addr = "10.203.0.2:51820"
+cert_file = "relay/relay.pem"
+key_file = "relay/relay-key.pem"
+token_file = "relay/token"
+
+[limits]
+max_active_sessions = 2
+max_pending_handshakes = 2
+setup_timeout_secs = 10
+idle_timeout_secs = 60

@@ -1,0 +1,10 @@
+# wg setconf format; macos.sh installs the address, MTU, and demo routes.
+[Interface]
+PrivateKey = @CLIENT_PRIVATE_KEY@
+ListenPort = 51820
+
+[Peer]
+PublicKey = @EXIT_PUBLIC_KEY@
+Endpoint = 127.0.0.1:51821
+AllowedIPs = 10.203.1.0/24, 10.203.2.1/32
+PersistentKeepalive = 5
