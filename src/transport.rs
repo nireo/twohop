@@ -7,226 +7,96 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, ensure};
 use bytes::Bytes;
-use quinn::{
-    Connection, Endpoint, RecvStream, SendStream, TransportConfig,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
-};
-use rustls::{
-    RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-};
-use subtle::ConstantTimeEq;
+use quinn::{Connection, Endpoint, RecvStream, TransportConfig};
 use tokio::{net::UdpSocket, time::timeout};
 
-use crate::{
-    config::{ClientConfig, RelayConfig},
-    protocol::{self, ALPN, AuthRequest, AuthResponse, MAX_DATAGRAM, VERSION},
-};
+use crate::protocol::{MAX_DATAGRAM, MAX_FRAME, PROTOCOL_ERROR};
 
-const DATAGRAM_BUFFER: usize = 64 * 1024;
-const UDP_BUFFER: usize = 65_536;
+pub const DATAGRAM_BUFFER: usize = 64 * 1024;
+pub const UDP_BUFFER: usize = 65_536;
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const KEEPALIVE: Duration = Duration::from_secs(20);
+pub const REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
-pub async fn run_client(config: ClientConfig) -> Result<()> {
-    let token = protocol::load_token(&config.token_file)?;
-    let mut roots = RootCertStore::empty();
+#[derive(Default)]
+struct Traffic {
+    packets: AtomicU64,
+    bytes: AtomicU64,
+    oversized: AtomicU64,
+}
 
-    for cert in
-        CertificateDer::pem_file_iter(&config.ca_cert_file).context("cannot open CA certificate")?
-    {
-        roots.add(cert.context("invalid CA certificate PEM")?)?;
+#[derive(Default)]
+pub struct Stats {
+    udp_to_quic: Traffic,
+    quic_to_udp: Traffic,
+    pub disconnected_drops: AtomicU64,
+    pub reconnects: AtomicU64,
+    pub setup_errors: AtomicU64,
+    pub session_errors: AtomicU64,
+    pub rejected: AtomicU64,
+}
+
+impl Stats {
+    pub fn report(&self, role: &'static str) {
+        tracing::info!(
+            role,
+            udp_to_quic_packets = self.udp_to_quic.packets.load(Ordering::Relaxed),
+            udp_to_quic_bytes = self.udp_to_quic.bytes.load(Ordering::Relaxed),
+            udp_to_quic_oversized = self.udp_to_quic.oversized.load(Ordering::Relaxed),
+            quic_to_udp_packets = self.quic_to_udp.packets.load(Ordering::Relaxed),
+            quic_to_udp_bytes = self.quic_to_udp.bytes.load(Ordering::Relaxed),
+            quic_to_udp_oversized = self.quic_to_udp.oversized.load(Ordering::Relaxed),
+            disconnected_drops = self.disconnected_drops.load(Ordering::Relaxed),
+            reconnects = self.reconnects.load(Ordering::Relaxed),
+            setup_errors = self.setup_errors.load(Ordering::Relaxed),
+            session_errors = self.session_errors.load(Ordering::Relaxed),
+            rejected = self.rejected.load(Ordering::Relaxed),
+            "traffic counters"
+        );
     }
-    ensure!(!roots.is_empty(), "CA certificate file has no certificates");
-
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    let mut quic = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
-    quic.transport_config(transport_config());
-
-    let bind_addr = match config.relay_addr.ip() {
-        IpAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-        IpAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-    };
-
-    let mut endpoint = Endpoint::client(bind_addr)?;
-    endpoint.set_default_client_config(quic);
-
-    let local = UdpSocket::bind(config.local_bind)
-        .await
-        .context("cannot bind local UDP socket")?;
-
-    local
-        .connect(SocketAddr::new(
-            Ipv4Addr::LOCALHOST.into(),
-            config.wireguard_port,
-        ))
-        .await
-        .context("cannot connect local WireGuard socket")?;
-
-    let connection = timeout(
-        Duration::from_secs(10),
-        endpoint.connect(config.relay_addr, &config.server_name)?,
-    )
-    .await
-    .context("relay connection timed out")??;
-
-    let result = client_session(&connection, &local, token).await;
-    connection.close(0_u32.into(), b"session ended");
-    endpoint.wait_idle().await;
-
-    result
 }
 
-async fn client_session(connection: &Connection, local: &UdpSocket, token: String) -> Result<()> {
-    let (mut control_send, mut control_recv) = connection.open_bi().await?;
-    protocol::write_frame(
-        &mut control_send,
-        &AuthRequest {
-            version: VERSION,
-            token,
-        },
-    )
-    .await?;
+// Closing on drop also covers cancelled and timed-out setup futures.
+pub struct CloseOnDrop(pub Connection);
 
-    let response: AuthResponse = timeout(
-        Duration::from_secs(10),
-        protocol::read_frame(&mut control_recv),
-    )
-    .await
-    .context("relay authentication timed out")??;
-
-    ensure!(
-        response.version == VERSION,
-        "relay returned an unsupported version"
-    );
-    ensure!(
-        response.max_datagram_size == MAX_DATAGRAM,
-        "relay returned an unsupported datagram size"
-    );
-
-    check_datagram_budget(connection)?;
-    eprintln!("client session ready");
-    forward_session(connection, local, &mut control_recv).await
-}
-
-pub async fn run_relay(config: RelayConfig) -> Result<()> {
-    let token = Arc::new(protocol::load_token(&config.token_file)?);
-    let certs = CertificateDer::pem_file_iter(&config.cert_file)
-        .context("cannot open relay certificate")?
-        .collect::<Result<Vec<_>, _>>()
-        .context("invalid relay certificate PEM")?;
-    ensure!(
-        !certs.is_empty(),
-        "relay certificate file has no certificates"
-    );
-
-    let key =
-        PrivateKeyDer::from_pem_file(&config.key_file).context("invalid relay private key PEM")?;
-
-    let mut tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    let mut quic = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
-    quic.transport_config(transport_config());
-
-    let endpoint =
-        Endpoint::server(quic, config.listen).context("cannot bind relay QUIC socket")?;
-    eprintln!("relay listening on {}", endpoint.local_addr()?);
-
-    loop {
-        tokio::select! {
-            incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else { break; };
-                let token = token.clone();
-                let exit_addr = config.exit_addr;
-                let setup_timeout = Duration::from_secs(config.limits.setup_timeout_secs);
-                tokio::spawn(async move {
-                    match timeout(setup_timeout, incoming).await {
-                        Ok(Ok(connection)) => {
-                            match timeout(setup_timeout, relay_setup(&connection, exit_addr, &token)).await {
-                                Ok(Ok((_control_send, mut control_recv, upstream))) => {
-                                    eprintln!("relay session ready");
-                                    if let Err(error) = forward_session(&connection, &upstream, &mut control_recv).await {
-                                        eprintln!("relay session ended: {error:#}");
-                                    }
-                                    connection.close(0_u32.into(), b"session ended");
-                                }
-                                Ok(Err(error)) => {
-                                    eprintln!("relay session setup failed: {error:#}");
-                                    connection.close(1_u32.into(), b"session rejected");
-                                }
-                                Err(_) => {
-                                    eprintln!("relay session setup timed out");
-                                    connection.close(1_u32.into(), b"session rejected");
-                                }
-                            }
-                        }
-                        Ok(Err(error)) => eprintln!("relay handshake failed: {error}"),
-                        Err(_) => eprintln!("relay handshake timed out"),
-                    }
-                });
-            }
-            _ = tokio::signal::ctrl_c() => break,
-        }
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close(0_u32.into(), b"session ended");
     }
-    endpoint.close(0_u32.into(), b"relay stopped");
-    endpoint.wait_idle().await;
-    Ok(())
 }
 
-async fn relay_setup(
-    connection: &Connection,
-    exit_addr: SocketAddr,
-    expected_token: &str,
-) -> Result<(SendStream, RecvStream, UdpSocket)> {
-    let (mut control_send, mut control_recv) = connection.accept_bi().await?;
-    let request: AuthRequest = protocol::read_frame(&mut control_recv).await?;
-    ensure!(
-        request.version == VERSION
-            && bool::from(request.token.as_bytes().ct_eq(expected_token.as_bytes())),
-        "authentication failed"
-    );
-    check_datagram_budget(connection)?;
-
-    let bind_addr = match exit_addr.ip() {
-        IpAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-        IpAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-    };
-    let upstream = UdpSocket::bind(bind_addr)
-        .await
-        .context("cannot bind exit UDP socket")?;
-    upstream
-        .connect(exit_addr)
-        .await
-        .context("cannot connect exit UDP socket")?;
-
-    protocol::write_frame(
-        &mut control_send,
-        &AuthResponse {
-            version: VERSION,
-            max_datagram_size: MAX_DATAGRAM,
+pub fn wildcard(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(
+        match addr.ip() {
+            IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+            IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
         },
+        0,
     )
-    .await?;
-    Ok((control_send, control_recv, upstream))
 }
 
-fn transport_config() -> Arc<TransportConfig> {
+pub fn transport_config(
+    idle_timeout: Duration,
+    keepalive: Option<Duration>,
+) -> Result<Arc<TransportConfig>> {
     let mut config = TransportConfig::default();
+    config.max_idle_timeout(Some(idle_timeout.try_into()?));
+    config.keep_alive_interval(keepalive);
     config.max_concurrent_bidi_streams(1_u8.into());
     config.max_concurrent_uni_streams(0_u8.into());
+    // One bounded control frame, with room for its prefix and protocol violation detection.
+    let control_window = (MAX_FRAME + 4 + 1) as u32;
+    config.stream_receive_window(control_window.into());
+    config.receive_window(control_window.into());
+    config.send_window(u64::from(control_window));
     config.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
     config.datagram_send_buffer_size(DATAGRAM_BUFFER);
-    Arc::new(config)
+    Ok(Arc::new(config))
 }
 
-fn check_datagram_budget(connection: &Connection) -> Result<()> {
+pub fn check_datagram_budget(connection: &Connection) -> Result<()> {
     ensure!(
         connection
             .max_datagram_size()
@@ -236,68 +106,116 @@ fn check_datagram_budget(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-async fn forward_session(
+pub async fn forward_session(
     connection: &Connection,
     socket: &UdpSocket,
     control: &mut RecvStream,
-) -> Result<()> {
-    let oversized = AtomicU64::new(0);
-    let result = tokio::select! {
-        result = udp_to_quic(socket, connection, &oversized) => result,
-        result = quic_to_udp(connection, socket, &oversized) => result,
-        result = watch_control(control) => result,
-        result = connection.accept_bi() => match result {
-            Ok(_) => Err(anyhow::anyhow!("unexpected control stream")),
-            Err(error) => Err(error.into()),
+    stats: &Stats,
+) -> &'static str {
+    let mut control_byte = [0_u8; 1];
+    let reason = tokio::select! {
+        reason = udp_to_quic(socket, connection, &stats.udp_to_quic) => reason,
+        reason = quic_to_udp(connection, socket, &stats.quic_to_udp) => reason,
+        result = control.read(&mut control_byte) => match result {
+            Ok(Some(_)) => "unexpected_control_data",
+            _ => "control_closed",
         },
-        result = connection.accept_uni() => match result {
-            Ok(_) => Err(anyhow::anyhow!("unexpected unidirectional stream")),
-            Err(error) => Err(error.into()),
+        result = connection.accept_bi() => if result.is_ok() {
+            "unexpected_control_stream"
+        } else {
+            "transport_closed"
         },
+        result = connection.accept_uni() => if result.is_ok() {
+            "unexpected_control_stream"
+        } else {
+            "transport_closed"
+        },
+        _ = connection.closed() => "transport_closed",
     };
-    let dropped = oversized.load(Ordering::Relaxed);
-    if dropped > 0 {
-        eprintln!("session oversized datagrams dropped: {dropped}");
+    let protocol_error = matches!(
+        reason,
+        "unexpected_control_data" | "unexpected_control_stream"
+    );
+    let normal_close = match connection.close_reason() {
+        Some(quinn::ConnectionError::LocallyClosed) => true,
+        Some(quinn::ConnectionError::ApplicationClosed(close)) => close.error_code == 0_u32.into(),
+        _ => false,
+    };
+    if protocol_error {
+        connection.close(PROTOCOL_ERROR.into(), b"protocol error");
     }
-    result
+    if protocol_error || !normal_close {
+        stats.session_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    reason
 }
 
-async fn udp_to_quic(
-    socket: &UdpSocket,
-    connection: &Connection,
-    oversized: &AtomicU64,
-) -> Result<()> {
+async fn udp_to_quic(socket: &UdpSocket, connection: &Connection, stats: &Traffic) -> &'static str {
     let mut buffer = vec![0_u8; UDP_BUFFER];
     loop {
-        let size = socket.recv(&mut buffer).await?;
+        let size = match socket.recv(&mut buffer).await {
+            Ok(size) => size,
+            Err(_) => return "udp_receive_failed",
+        };
         if size > MAX_DATAGRAM {
-            oversized.fetch_add(1, Ordering::Relaxed);
+            stats.oversized.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        check_datagram_budget(connection)?;
-        connection.send_datagram(Bytes::copy_from_slice(&buffer[..size]))?;
+        if check_datagram_budget(connection).is_err() {
+            return "datagram_budget_lost";
+        }
+        if connection
+            .send_datagram(Bytes::copy_from_slice(&buffer[..size]))
+            .is_err()
+        {
+            return "quic_send_failed";
+        }
+        stats.packets.fetch_add(1, Ordering::Relaxed);
+        stats.bytes.fetch_add(size as u64, Ordering::Relaxed);
     }
 }
 
-async fn quic_to_udp(
-    connection: &Connection,
-    socket: &UdpSocket,
-    oversized: &AtomicU64,
-) -> Result<()> {
+async fn quic_to_udp(connection: &Connection, socket: &UdpSocket, stats: &Traffic) -> &'static str {
     loop {
-        let datagram = connection.read_datagram().await?;
+        let datagram = match connection.read_datagram().await {
+            Ok(datagram) => datagram,
+            Err(_) => return "transport_closed",
+        };
         if datagram.len() > MAX_DATAGRAM {
-            oversized.fetch_add(1, Ordering::Relaxed);
+            stats.oversized.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        socket.send(&datagram).await?;
+        if socket.send(&datagram).await.is_err() {
+            return "udp_send_failed";
+        }
+        stats.packets.fetch_add(1, Ordering::Relaxed);
+        stats
+            .bytes
+            .fetch_add(datagram.len() as u64, Ordering::Relaxed);
     }
 }
 
-async fn watch_control(stream: &mut RecvStream) -> Result<()> {
-    let mut byte = [0_u8; 1];
-    match stream.read(&mut byte).await? {
-        Some(_) => bail!("unexpected control data"),
-        None => bail!("control stream closed"),
+pub async fn shutdown() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+pub async fn close_endpoint(endpoint: &Endpoint) {
+    endpoint.close(0_u32.into(), b"shutdown");
+    if timeout(Duration::from_secs(3), endpoint.wait_idle())
+        .await
+        .is_err()
+    {
+        tracing::warn!("transport drain timed out");
     }
 }

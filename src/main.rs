@@ -2,8 +2,10 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 
+mod client;
 pub mod config;
 mod protocol;
+mod relay;
 mod transport;
 
 #[derive(Parser)]
@@ -32,14 +34,19 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time()
+        .init();
 
     let result = match cli.command {
         Command::Client { config } => match config::load_client(&config) {
-            Ok(config) => transport::run_client(config).await,
+            Ok(config) => client::run(config).await,
             Err(error) => Err(anyhow::anyhow!(error)),
         },
         Command::Relay { config } => match config::load_relay(&config) {
-            Ok(config) => transport::run_relay(config).await,
+            Ok(config) => relay::run(config).await,
             Err(error) => Err(anyhow::anyhow!(error)),
         },
     };

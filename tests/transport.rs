@@ -1,195 +1,13 @@
+mod common;
+
+use common::*;
 use std::{
     fs,
     net::{SocketAddr, UdpSocket},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::Arc,
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
 };
-
-use bytes::Bytes;
-use quinn::crypto::rustls::QuicClientConfig;
-use rustls::{
-    RootCertStore,
-    pki_types::{CertificateDer, pem::PemObject},
-};
-
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("twohop-test-{}-{nonce}", std::process::id()));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-struct Process(Child);
-
-impl Process {
-    fn start(role: &str, config: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_twohop"))
-            .arg(role)
-            .arg("--config")
-            .arg(config)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        Self(child)
-    }
-
-    fn assert_running(&mut self) {
-        assert!(self.0.try_wait().unwrap().is_none(), "process exited early");
-    }
-
-    fn wait_for_failure(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = self.0.try_wait().unwrap() {
-                assert!(!status.success(), "invalid client unexpectedly succeeded");
-                return;
-            }
-            assert!(Instant::now() < deadline, "invalid client did not fail");
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn client_config(
-    local_port: u16,
-    wg_port: u16,
-    relay_port: u16,
-    server_name: &str,
-    ca: &Path,
-    token: &Path,
-) -> String {
-    format!(
-        "local_bind = \"127.0.0.1:{local_port}\"\n\
-         wireguard_port = {wg_port}\n\
-         relay_addr = \"127.0.0.1:{relay_port}\"\n\
-         server_name = \"{server_name}\"\n\
-         ca_cert_file = \"{}\"\n\
-         token_file = \"{}\"\n",
-        ca.display(),
-        token.display()
-    )
-}
-
-fn recv_matching(socket: &UdpSocket, expected: &[u8], deadline: Instant) -> SocketAddr {
-    let mut buffer = [0_u8; 65_536];
-    loop {
-        assert!(Instant::now() < deadline, "timed out waiting for packet");
-        match socket.recv_from(&mut buffer) {
-            Ok((size, source)) if &buffer[..size] == expected => return source,
-            Ok(_) => continue,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(error) => panic!("UDP receive failed: {error}"),
-        }
-    }
-}
-
-fn assert_no_packet(socket: &UdpSocket) {
-    let mut buffer = [0_u8; 65_536];
-    socket
-        .set_read_timeout(Some(Duration::from_millis(300)))
-        .unwrap();
-    let result = socket.recv_from(&mut buffer);
-    assert!(
-        matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut),
-        "unexpected UDP packet: {result:?}"
-    );
-}
-
-fn drain(socket: &UdpSocket) {
-    socket.set_nonblocking(true).unwrap();
-    let mut buffer = [0_u8; 65_536];
-    loop {
-        match socket.recv_from(&mut buffer) {
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(error) => panic!("UDP drain failed: {error}"),
-        }
-    }
-    socket.set_nonblocking(false).unwrap();
-}
-
-fn reject_control(relay_port: u16, ca: &Path, length: u32, payload: &[u8]) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(CertificateDer::from_pem_file(ca).unwrap())
-            .unwrap();
-        let mut tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![b"twohop/1".to_vec()];
-        let mut quic = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
-        let mut transport = quinn::TransportConfig::default();
-        transport.datagram_receive_buffer_size(Some(64 * 1024));
-        quic.transport_config(Arc::new(transport));
-        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        endpoint.set_default_client_config(quic);
-        let connection = endpoint
-            .connect(
-                SocketAddr::from(([127, 0, 0, 1], relay_port)),
-                "relay.twohop.test",
-            )
-            .unwrap()
-            .await
-            .unwrap();
-        connection
-            .send_datagram(Bytes::from_static(b"unauthenticated"))
-            .unwrap();
-        let (mut send, mut recv) = connection.open_bi().await.unwrap();
-        send.write_all(&length.to_be_bytes()).await.unwrap();
-        send.write_all(payload).await.unwrap();
-        let mut response = [0_u8; 4];
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut response)).await;
-        assert!(
-            matches!(result, Ok(Err(_))),
-            "invalid control message was not rejected"
-        );
-        connection.close(0_u32.into(), b"test complete");
-        endpoint.wait_idle().await;
-    });
-}
 
 #[test]
 fn authenticated_udp_round_trip_and_rejections() {
@@ -256,7 +74,7 @@ fn authenticated_udp_round_trip_and_rejections() {
     .unwrap();
 
     let mut relay = Process::start("relay", &relay_path);
-    thread::sleep(Duration::from_millis(100));
+    relay.wait_for_log("relay listening", 1);
     relay.assert_running();
     let mut client = Process::start("client", &client_path);
     let local_addr = SocketAddr::from(([127, 0, 0, 1], local_port));
@@ -379,4 +197,12 @@ fn authenticated_udp_round_trip_and_rejections() {
     .unwrap();
     let mut wrong_name_client = Process::start("client", &wrong_name_path);
     wrong_name_client.wait_for_failure();
+
+    client.stop("TERM");
+    relay.stop("TERM");
+    assert!(client.logs().contains("udp_to_quic_oversized=1"));
+    assert!(relay.logs().contains("udp_to_quic_oversized=1"));
+    let token = fs::read_to_string(credentials.join("token")).unwrap();
+    assert!(!client.logs().contains(token.trim()));
+    assert!(!relay.logs().contains(token.trim()));
 }

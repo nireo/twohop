@@ -9,6 +9,11 @@ pub const VERSION: u8 = 1;
 pub const MAX_FRAME: usize = 4096;
 pub const MAX_DATAGRAM: usize = 1040;
 
+// Application close codes; reasons are fixed strings, never peer-provided data.
+pub const AUTH_REJECTED: u32 = 1;
+pub const PROTOCOL_ERROR: u32 = 2;
+pub const SERVER_BUSY: u32 = 3;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthRequest {

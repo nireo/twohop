@@ -92,6 +92,17 @@ impl RelayLimits {
         if self.setup_timeout_secs == 0 || self.idle_timeout_secs == 0 {
             return Err("setup_timeout_secs and idle_timeout_secs must be nonzero".into());
         }
+        if std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(self.setup_timeout_secs))
+            .is_none()
+        {
+            return Err("setup_timeout_secs exceeds the clock limit".into());
+        }
+        if quinn::IdleTimeout::try_from(std::time::Duration::from_secs(self.idle_timeout_secs))
+            .is_err()
+        {
+            return Err("idle_timeout_secs exceeds the QUIC transport limit".into());
+        }
         Ok(())
     }
 }
@@ -149,4 +160,31 @@ fn load<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
             error.message()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_unrepresentable_timeouts_before_startup() {
+        let mut limits = RelayLimits {
+            max_active_sessions: 1,
+            max_pending_handshakes: 1,
+            setup_timeout_secs: 10,
+            idle_timeout_secs: 60,
+        };
+        assert!(limits.validate().is_ok());
+        limits.setup_timeout_secs = u64::MAX;
+        assert_eq!(
+            limits.validate().unwrap_err(),
+            "setup_timeout_secs exceeds the clock limit"
+        );
+        limits.setup_timeout_secs = 10;
+        limits.idle_timeout_secs = u64::MAX;
+        assert_eq!(
+            limits.validate().unwrap_err(),
+            "idle_timeout_secs exceeds the QUIC transport limit"
+        );
+    }
 }
