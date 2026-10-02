@@ -7,16 +7,27 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, ensure};
 use bytes::Bytes;
-use quinn::{Connection, Endpoint, RecvStream, TransportConfig};
+use quinn::{Connection, Endpoint, RecvStream, SendStream, TransportConfig};
 use tokio::{net::UdpSocket, time::timeout};
 
 use crate::protocol::{MAX_DATAGRAM, MAX_FRAME, PROTOCOL_ERROR};
 
 pub const DATAGRAM_BUFFER: usize = 64 * 1024;
 pub const UDP_BUFFER: usize = 65_536;
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// The receive APIs require this full buffer, preventing oversized UDP packets
+// from being silently truncated into apparently valid protocol datagrams.
+pub type UdpBuffer = [u8; UDP_BUFFER];
+
+pub fn udp_buffer() -> Box<UdpBuffer> {
+    vec![0; UDP_BUFFER]
+        .into_boxed_slice()
+        .try_into()
+        .expect("fixed UDP buffer length")
+}
+pub fn client_idle_timeout() -> quinn::IdleTimeout {
+    quinn::VarInt::from_u32(60_000).into()
+}
 pub const KEEPALIVE: Duration = Duration::from_secs(20);
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -78,11 +89,11 @@ pub fn wildcard(addr: SocketAddr) -> SocketAddr {
 }
 
 pub fn transport_config(
-    idle_timeout: Duration,
+    idle_timeout: quinn::IdleTimeout,
     keepalive: Option<Duration>,
-) -> Result<Arc<TransportConfig>> {
+) -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
-    config.max_idle_timeout(Some(idle_timeout.try_into()?));
+    config.max_idle_timeout(Some(idle_timeout));
     config.keep_alive_interval(keepalive);
     config.max_concurrent_bidi_streams(1_u8.into());
     config.max_concurrent_uni_streams(0_u8.into());
@@ -93,49 +104,89 @@ pub fn transport_config(
     config.send_window(u64::from(control_window));
     config.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
     config.datagram_send_buffer_size(DATAGRAM_BUFFER);
-    Ok(Arc::new(config))
+    Arc::new(config)
 }
 
-pub fn check_datagram_budget(connection: &Connection) -> Result<()> {
-    ensure!(
-        connection
-            .max_datagram_size()
-            .is_some_and(|size| size >= MAX_DATAGRAM),
-        "QUIC path cannot send {MAX_DATAGRAM}-byte datagrams"
-    );
-    Ok(())
+pub fn supports_datagrams(connection: &Connection) -> bool {
+    connection
+        .max_datagram_size()
+        .is_some_and(|size| size >= MAX_DATAGRAM)
+}
+
+// Owning the send half prevents an accidental FIN while the receive half is monitored.
+pub struct ControlStream {
+    _send: SendStream,
+    recv: RecvStream,
+}
+
+impl ControlStream {
+    pub fn new(send: SendStream, recv: RecvStream) -> Self {
+        Self { _send: send, recv }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    UnexpectedControlData,
+    UnexpectedControlStream,
+    ControlClosed,
+    TransportClosed,
+    UdpReceiveFailed,
+    UdpSendFailed,
+    DatagramBudgetLost,
+    QuicSendFailed,
+}
+
+impl SessionEnd {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnexpectedControlData => "unexpected_control_data",
+            Self::UnexpectedControlStream => "unexpected_control_stream",
+            Self::ControlClosed => "control_closed",
+            Self::TransportClosed => "transport_closed",
+            Self::UdpReceiveFailed => "udp_receive_failed",
+            Self::UdpSendFailed => "udp_send_failed",
+            Self::DatagramBudgetLost => "datagram_budget_lost",
+            Self::QuicSendFailed => "quic_send_failed",
+        }
+    }
+
+    pub fn is_protocol_error(self) -> bool {
+        matches!(
+            self,
+            Self::UnexpectedControlData | Self::UnexpectedControlStream
+        )
+    }
 }
 
 pub async fn forward_session(
     connection: &Connection,
     socket: &UdpSocket,
-    control: &mut RecvStream,
+    control: &mut ControlStream,
     stats: &Stats,
-) -> &'static str {
+    buffer: &mut UdpBuffer,
+) -> SessionEnd {
     let mut control_byte = [0_u8; 1];
     let reason = tokio::select! {
-        reason = udp_to_quic(socket, connection, &stats.udp_to_quic) => reason,
+        reason = udp_to_quic(socket, connection, &stats.udp_to_quic, buffer) => reason,
         reason = quic_to_udp(connection, socket, &stats.quic_to_udp) => reason,
-        result = control.read(&mut control_byte) => match result {
-            Ok(Some(_)) => "unexpected_control_data",
-            _ => "control_closed",
+        result = control.recv.read(&mut control_byte) => match result {
+            Ok(Some(_)) => SessionEnd::UnexpectedControlData,
+            _ => SessionEnd::ControlClosed,
         },
         result = connection.accept_bi() => if result.is_ok() {
-            "unexpected_control_stream"
+            SessionEnd::UnexpectedControlStream
         } else {
-            "transport_closed"
+            SessionEnd::TransportClosed
         },
         result = connection.accept_uni() => if result.is_ok() {
-            "unexpected_control_stream"
+            SessionEnd::UnexpectedControlStream
         } else {
-            "transport_closed"
+            SessionEnd::TransportClosed
         },
-        _ = connection.closed() => "transport_closed",
+        _ = connection.closed() => SessionEnd::TransportClosed,
     };
-    let protocol_error = matches!(
-        reason,
-        "unexpected_control_data" | "unexpected_control_stream"
-    );
+    let protocol_error = reason.is_protocol_error();
     let normal_close = match connection.close_reason() {
         Some(quinn::ConnectionError::LocallyClosed) => true,
         Some(quinn::ConnectionError::ApplicationClosed(close)) => close.error_code == 0_u32.into(),
@@ -150,43 +201,47 @@ pub async fn forward_session(
     reason
 }
 
-async fn udp_to_quic(socket: &UdpSocket, connection: &Connection, stats: &Traffic) -> &'static str {
-    let mut buffer = vec![0_u8; UDP_BUFFER];
+async fn udp_to_quic(
+    socket: &UdpSocket,
+    connection: &Connection,
+    stats: &Traffic,
+    buffer: &mut UdpBuffer,
+) -> SessionEnd {
     loop {
-        let size = match socket.recv(&mut buffer).await {
+        let size = match socket.recv(&mut buffer[..]).await {
             Ok(size) => size,
-            Err(_) => return "udp_receive_failed",
+            Err(_) => return SessionEnd::UdpReceiveFailed,
         };
         if size > MAX_DATAGRAM {
             stats.oversized.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if check_datagram_budget(connection).is_err() {
-            return "datagram_budget_lost";
+        if !supports_datagrams(connection) {
+            return SessionEnd::DatagramBudgetLost;
         }
         if connection
             .send_datagram(Bytes::copy_from_slice(&buffer[..size]))
             .is_err()
         {
-            return "quic_send_failed";
+            return SessionEnd::QuicSendFailed;
         }
         stats.packets.fetch_add(1, Ordering::Relaxed);
         stats.bytes.fetch_add(size as u64, Ordering::Relaxed);
     }
 }
 
-async fn quic_to_udp(connection: &Connection, socket: &UdpSocket, stats: &Traffic) -> &'static str {
+async fn quic_to_udp(connection: &Connection, socket: &UdpSocket, stats: &Traffic) -> SessionEnd {
     loop {
         let datagram = match connection.read_datagram().await {
             Ok(datagram) => datagram,
-            Err(_) => return "transport_closed",
+            Err(_) => return SessionEnd::TransportClosed,
         };
         if datagram.len() > MAX_DATAGRAM {
             stats.oversized.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         if socket.send(&datagram).await.is_err() {
-            return "udp_send_failed";
+            return SessionEnd::UdpSendFailed;
         }
         stats.packets.fetch_add(1, Ordering::Relaxed);
         stats
@@ -195,7 +250,7 @@ async fn quic_to_udp(connection: &Connection, socket: &UdpSocket, stats: &Traffi
     }
 }
 
-pub async fn shutdown() -> Result<()> {
+pub async fn shutdown() -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let mut terminate =

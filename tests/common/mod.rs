@@ -82,34 +82,6 @@ impl Drop for Process {
     }
 }
 
-pub fn free_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-pub fn client_config(
-    local_port: u16,
-    wg_port: u16,
-    relay_port: u16,
-    server_name: &str,
-    ca: &Path,
-    token: &Path,
-) -> String {
-    format!(
-        "local_bind = \"127.0.0.1:{local_port}\"\n\
-         wireguard_port = {wg_port}\n\
-         relay_addr = \"127.0.0.1:{relay_port}\"\n\
-         server_name = \"{server_name}\"\n\
-         ca_cert_file = \"{}\"\n\
-         token_file = \"{}\"\n",
-        ca.display(),
-        token.display()
-    )
-}
-
 pub fn recv_matching(socket: &UdpSocket, expected: &[u8], deadline: Instant) -> SocketAddr {
     let mut buffer = [0_u8; 65_536];
     loop {
@@ -153,34 +125,9 @@ pub fn drain(socket: &UdpSocket) {
     socket.set_nonblocking(false).unwrap();
 }
 
-pub fn reject_control(relay_port: u16, ca: &Path, length: u32, payload: &[u8]) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(CertificateDer::from_pem_file(ca).unwrap())
-            .unwrap();
-        let mut tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![b"twohop/1".to_vec()];
-        let mut quic = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()));
-        let mut transport = quinn::TransportConfig::default();
-        transport.datagram_receive_buffer_size(Some(64 * 1024));
-        quic.transport_config(Arc::new(transport));
-        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        endpoint.set_default_client_config(quic);
-        let connection = endpoint
-            .connect(
-                SocketAddr::from(([127, 0, 0, 1], relay_port)),
-                "relay.twohop.test",
-            )
-            .unwrap()
-            .await
-            .unwrap();
+pub fn reject_control(fixture: &Fixture, length: u32, payload: &[u8]) {
+    runtime().block_on(async {
+        let (endpoint, connection) = raw_connection(fixture).await;
         connection
             .send_datagram(Bytes::from_static(b"unauthenticated"))
             .unwrap();
@@ -217,6 +164,18 @@ impl Process {
         }
     }
 
+    pub fn listening_addr(&mut self, message: &str, field: &str) -> SocketAddr {
+        self.wait_for_log(message, 1);
+        let logs = self.logs();
+        let line = logs.lines().find(|line| line.contains(message)).unwrap();
+        let prefix = format!("{field}=");
+        line.split_whitespace()
+            .find_map(|word| word.strip_prefix(&prefix))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
     pub fn stop(&mut self, signal: &str) {
         let status = Command::new("kill")
             .arg(format!("-{signal}"))
@@ -248,25 +207,22 @@ impl Fixture {
     pub fn new(active: usize, pending: usize, setup_secs: u64, idle_secs: u64) -> Self {
         let temp = TestDir::new();
         let credentials = temp.0.join("credentials");
-        let generated = Command::new("sh")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev/generate-credentials.sh"))
-            .arg(&credentials)
-            .output()
-            .unwrap();
-        assert!(
-            generated.status.success(),
-            "credential generation failed: {}",
-            String::from_utf8_lossy(&generated.stderr)
-        );
+        generate_credentials(&credentials);
         let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
         exit.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
-        let relay_addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
+        let relay_addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let relay_config = temp.0.join("relay.toml");
-        fs::write(&relay_config, format!(
-            "listen = \"{relay_addr}\"\nexit_addr = \"{}\"\ncert_file = \"{}\"\nkey_file = \"{}\"\ntoken_file = \"{}\"\n[limits]\nmax_active_sessions = {active}\nmax_pending_handshakes = {pending}\nsetup_timeout_secs = {setup_secs}\nidle_timeout_secs = {idle_secs}\n",
-            exit.local_addr().unwrap(), credentials.join("relay.pem").display(), credentials.join("relay-key.pem").display(), credentials.join("token").display()
-        )).unwrap();
+        write_config(
+            &relay_config,
+            &serde_json::json!({
+                "listen": relay_addr.to_string(), "exit_addr": exit.local_addr().unwrap().to_string(),
+                "cert_file": credentials.join("relay.pem"), "key_file": credentials.join("relay-key.pem"),
+                "token_file": credentials.join("token"),
+                "limits": { "max_active_sessions": active, "max_pending_handshakes": pending,
+                    "setup_timeout_secs": setup_secs, "idle_timeout_secs": idle_secs }
+            }),
+        );
         Self {
             temp,
             credentials,
@@ -276,9 +232,18 @@ impl Fixture {
         }
     }
 
-    pub fn relay(&self) -> Process {
+    pub fn relay(&mut self) -> Process {
         let mut relay = Process::start("relay", &self.relay_config);
-        relay.wait_for_log("relay listening", 1);
+        let addr = relay.listening_addr("relay listening", "listen");
+        if self.relay_addr.port() == 0 {
+            // Subsequent restarts use the address discovered from the first OS-assigned bind.
+            let mut config: toml::Value =
+                toml::from_str(&fs::read_to_string(&self.relay_config).unwrap()).unwrap();
+            config["listen"] = addr.to_string().into();
+            write_config(&self.relay_config, &config);
+            self.relay_addr = addr;
+        }
+        assert_eq!(addr, self.relay_addr);
         relay
     }
 
@@ -286,21 +251,35 @@ impl Fixture {
         let wg = UdpSocket::bind("127.0.0.1:0").unwrap();
         wg.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
-        let local_addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
+        let mut client = self.client_with(
+            id,
+            wg.local_addr().unwrap().port(),
+            "relay.twohop.test",
+            &self.credentials.join("ca.pem"),
+            &self.credentials.join("token"),
+        );
+        let local = client.listening_addr("client listening", "local");
+        (client, wg, local)
+    }
+
+    pub fn client_with(
+        &self,
+        id: usize,
+        wg_port: u16,
+        server_name: &str,
+        ca: &Path,
+        token: &Path,
+    ) -> Process {
         let config = self.temp.0.join(format!("client-{id}.toml"));
-        fs::write(
+        write_config(
             &config,
-            client_config(
-                local_addr.port(),
-                wg.local_addr().unwrap().port(),
-                self.relay_addr.port(),
-                "relay.twohop.test",
-                &self.credentials.join("ca.pem"),
-                &self.credentials.join("token"),
-            ),
-        )
-        .unwrap();
-        (Process::start("client", &config), wg, local_addr)
+            &serde_json::json!({
+                "local_bind": "127.0.0.1:0", "wireguard_port": wg_port,
+                "relay_addr": self.relay_addr.to_string(), "server_name": server_name,
+                "ca_cert_file": ca, "token_file": token
+            }),
+        );
+        Process::start("client", &config)
     }
 
     pub fn token(&self) -> String {
@@ -380,4 +359,41 @@ pub async fn closed(connection: &quinn::Connection) -> quinn::ConnectionError {
     tokio::time::timeout(Duration::from_secs(3), connection.closed())
         .await
         .unwrap()
+}
+
+pub fn generate_credentials(path: &Path) {
+    let generated = Command::new("sh")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/dev/generate-credentials.sh"))
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "credential generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+}
+
+pub fn round_trip(
+    fixture: &Fixture,
+    wg: &UdpSocket,
+    local: SocketAddr,
+    packet: &[u8],
+) -> SocketAddr {
+    wg.send_to(packet, local).unwrap();
+    let source = recv_matching(
+        &fixture.exit,
+        packet,
+        Instant::now() + Duration::from_secs(3),
+    );
+    fixture.exit.send_to(packet, source).unwrap();
+    assert_eq!(
+        recv_matching(wg, packet, Instant::now() + Duration::from_secs(3)),
+        local
+    );
+    source
+}
+
+fn write_config(path: &Path, config: &impl serde::Serialize) {
+    fs::write(path, toml::to_string(config).unwrap()).unwrap();
 }

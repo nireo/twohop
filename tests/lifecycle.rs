@@ -2,7 +2,7 @@ mod common;
 
 use std::{
     fs,
-    net::{SocketAddr, UdpSocket},
+    net::UdpSocket,
     process::Command,
     thread,
     time::{Duration, Instant},
@@ -38,25 +38,10 @@ fn counter(process: &Process, name: &str) -> u64 {
         .unwrap()
 }
 
-fn round_trip(fixture: &Fixture, wg: &UdpSocket, local: SocketAddr, packet: &[u8]) -> SocketAddr {
-    wg.send_to(packet, local).unwrap();
-    let source = recv_matching(
-        &fixture.exit,
-        packet,
-        Instant::now() + Duration::from_secs(3),
-    );
-    fixture.exit.send_to(packet, source).unwrap();
-    assert_eq!(
-        recv_matching(wg, packet, Instant::now() + Duration::from_secs(3)),
-        local
-    );
-    source
-}
-
 #[test]
 fn concurrent_clients_recover_after_crash_without_replaying_outage_packets() {
     // Short idle timeout makes hard-crash detection fast; graceful restart is covered below.
-    let fixture = Fixture::new(2, 4, 2, 3);
+    let mut fixture = Fixture::new(2, 4, 2, 3);
     let mut relay = fixture.relay();
     let (mut client_a, wg_a, local_a) = fixture.client(1);
     let (mut client_b, wg_b, local_b) = fixture.client(2);
@@ -110,7 +95,7 @@ fn concurrent_clients_recover_after_crash_without_replaying_outage_packets() {
 
 #[test]
 fn pending_limit_and_setup_timeout_release_capacity() {
-    let fixture = Fixture::new(1, 1, 1, 60);
+    let mut fixture = Fixture::new(1, 1, 1, 60);
     let mut relay = fixture.relay();
     runtime().block_on(async {
         let (endpoint, stalled) = raw_connection(&fixture).await;
@@ -137,7 +122,7 @@ fn pending_limit_and_setup_timeout_release_capacity() {
 
 #[test]
 fn active_limit_is_retryable_and_graceful_restart_recovers() {
-    let fixture = Fixture::new(1, 4, 2, 60);
+    let mut fixture = Fixture::new(1, 4, 2, 60);
     let mut relay = fixture.relay();
     runtime().block_on(async {
         let (endpoint, occupied) = raw_connection(&fixture).await;
@@ -162,7 +147,7 @@ fn active_limit_is_retryable_and_graceful_restart_recovers() {
 
 #[test]
 fn shutdown_cancels_setup_and_client_connecting_or_backoff() {
-    let fixture = Fixture::new(1, 2, 10, 60);
+    let mut fixture = Fixture::new(1, 2, 10, 60);
     let mut relay = fixture.relay();
     runtime().block_on(async {
         let (_endpoint, pending) = raw_connection(&fixture).await;
@@ -199,7 +184,7 @@ fn shutdown_cancels_setup_and_client_connecting_or_backoff() {
 
 #[test]
 fn protocol_errors_and_control_eof_release_sessions_without_logging_payloads() {
-    let fixture = Fixture::new(2, 4, 2, 60);
+    let mut fixture = Fixture::new(2, 4, 2, 60);
     let mut relay = fixture.relay();
     runtime().block_on(async {
         let (endpoint, connection) = raw_connection(&fixture).await;
@@ -272,7 +257,7 @@ fn resources(process: &Process) -> (u64, usize) {
 
 #[test]
 fn churn_and_slow_receiver_keep_resources_bounded() {
-    let fixture = Fixture::new(2, 4, 2, 60);
+    let mut fixture = Fixture::new(2, 4, 2, 60);
     let mut relay = fixture.relay();
     runtime().block_on(async {
         let endpoint = raw_endpoint(&fixture);
@@ -332,7 +317,7 @@ fn churn_and_slow_receiver_keep_resources_bounded() {
 
 #[test]
 fn keepalive_preserves_an_idle_client_session() {
-    let fixture = Fixture::new(1, 2, 2, 23);
+    let mut fixture = Fixture::new(1, 2, 2, 23);
     let mut relay = fixture.relay();
     let (mut client, wg, local) = fixture.client(1);
     client.wait_for_log("client session ready", 1);
@@ -353,7 +338,7 @@ fn keepalive_preserves_an_idle_client_session() {
 
 #[test]
 fn client_stops_if_a_ready_relay_sends_unexpected_control_data() {
-    let fixture = Fixture::new(1, 2, 2, 60);
+    let mut fixture = Fixture::new(1, 2, 2, 60);
     runtime().block_on(async {
         use quinn::crypto::rustls::QuicServerConfig;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -373,6 +358,7 @@ fn client_stops_if_a_ready_relay_sends_unexpected_control_data() {
         transport.datagram_receive_buffer_size(Some(64 * 1024));
         server.transport_config(Arc::new(transport));
         let endpoint = quinn::Endpoint::server(server, fixture.relay_addr).unwrap();
+        fixture.relay_addr = endpoint.local_addr().unwrap();
         let (mut client, _wg, local) = fixture.client(1);
         let connection = tokio::time::timeout(Duration::from_secs(3), async {
             endpoint.accept().await.unwrap().await.unwrap()

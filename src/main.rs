@@ -3,7 +3,9 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::{Parser, Subcommand};
 
 mod client;
-pub mod config;
+mod config;
+mod credentials;
+mod error;
 mod protocol;
 mod relay;
 mod transport;
@@ -40,22 +42,21 @@ async fn main() -> ExitCode {
         .without_time()
         .init();
 
-    let result = match cli.command {
-        Command::Client { config } => match config::load_client(&config) {
-            Ok(config) => client::run(config).await,
-            Err(error) => Err(anyhow::anyhow!(error)),
-        },
-        Command::Relay { config } => match config::load_relay(&config) {
-            Ok(config) => relay::run(config).await,
-            Err(error) => Err(anyhow::anyhow!(error)),
-        },
-    };
+    let result = run(cli.command).await;
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error:#}");
+            eprintln!("{error}");
             ExitCode::FAILURE
         }
     }
+}
+
+async fn run(command: Command) -> Result<(), error::AppError> {
+    match command {
+        Command::Client { config } => client::run(config::load_client(&config)?).await?,
+        Command::Relay { config } => relay::run(config::load_relay(&config)?).await?,
+    }
+    Ok(())
 }
